@@ -30,9 +30,6 @@
 #include <stdlib.h>
 #include <windows.h>
 #include <string.h>
-#if defined(__linux__)
-#include <setjmp.h>
-#endif
 
 #define DEPTH 256
 typedef struct { uint64_t rets[4]; volatile uint64_t target; void *buf[32]; } SjSlot;   /* (buf: recomp_sj_setjmp's 248 bytes) */
@@ -40,16 +37,47 @@ typedef struct { SjSlot slot[DEPTH]; int depth, overflow; } SjStack;
 static _Thread_local SjStack *stack;
 static _Thread_local uint64_t sj_target;
 
-/* The Windows implementation below saves the Win64 ABI context explicitly. Linux uses
-   the native System V context through sigsetjmp/siglongjmp; the surrounding owner and
-   target bookkeeping is shared by both ABIs. */
+/* Both save the caller's context themselves, in assembly. A C wrapper around sigsetjmp saved its own frame, which is
+   gone once it returns: the longjmp then returned through a slot the owner's call had overwritten, as if the owner had
+   returned, and the text box thread called null pointers and faulted. */
 #if defined(__linux__)
-__attribute__((returns_twice)) int recomp_sj_setjmp(void **buf) {
-    return sigsetjmp(*(sigjmp_buf *)buf, 0);
+/* System V: buf holds rbx rbp r12 r13 r14 r15 at 0-40, rsp (after the return) at 48, the return address at 56,
+   mxcsr at 64 and the x87 control word at 68 */
+__attribute__((naked, returns_twice)) int recomp_sj_setjmp(void **buf) {
+    __asm__ volatile(
+        "movq %rbx, 0(%rdi)\n\t"
+        "movq %rbp, 8(%rdi)\n\t"
+        "movq %r12, 16(%rdi)\n\t"
+        "movq %r13, 24(%rdi)\n\t"
+        "movq %r14, 32(%rdi)\n\t"
+        "movq %r15, 40(%rdi)\n\t"
+        "leaq 8(%rsp), %rdx\n\t"
+        "movq %rdx, 48(%rdi)\n\t"
+        "movq (%rsp), %rdx\n\t"
+        "movq %rdx, 56(%rdi)\n\t"
+        "stmxcsr 64(%rdi)\n\t"
+        "fnstcw 68(%rdi)\n\t"
+        "xorl %eax, %eax\n\t"
+        "ret\n\t");
 }
 
-__attribute__((noreturn)) static void recomp_sj_longjmp(void **buf, int value) {
-    siglongjmp(*(sigjmp_buf *)buf, value);
+__attribute__((naked, noreturn)) static void recomp_sj_longjmp(void **buf, int value) {
+    __asm__ volatile(
+        "movq 0(%rdi), %rbx\n\t"
+        "movq 8(%rdi), %rbp\n\t"
+        "movq 16(%rdi), %r12\n\t"
+        "movq 24(%rdi), %r13\n\t"
+        "movq 32(%rdi), %r14\n\t"
+        "movq 40(%rdi), %r15\n\t"
+        "ldmxcsr 64(%rdi)\n\t"
+        "fldcw 68(%rdi)\n\t"
+        "movl %esi, %eax\n\t"
+        "testl %eax, %eax\n\t"
+        "jnz 1f\n\t"
+        "incl %eax\n\t"
+        "1:\n\t"
+        "movq 48(%rdi), %rsp\n\t"
+        "jmpq *56(%rdi)\n\t");
 }
 #else
 /* buf: rbx rbp rdi rsi r12 r13 r14 r15 at 0-56, rsp (after the return) at 64, the return address at 72, xmm6-15 at
